@@ -5,6 +5,8 @@ pub const WebSocket = @import("websocket.zig").WebSocket;
 pub const CookieOpts = @import("cookie.zig").CookieOpts;
 const serializeCookie = @import("cookie.zig").serializeCookie;
 const Connection = @import("server.zig").Connection;
+const zlib = @import("zlib");
+const build_options = @import("build_options");
 
 var no_buf: [0]u8 = .{};
 
@@ -409,14 +411,23 @@ pub const StreamingBodyWriter = struct {
     /// fails, so a handler that catches one can find out what happened
     /// instead of being told only that it did.
     err: ?Error = null,
+    /// Set when the body goes out gzipped: what is written goes through it
+    /// on the way to the framing.
+    compressor: ?*StreamCompressor = null,
     /// Everything a write to the connection can fail with, resolved to its
     /// cause rather than the `std.Io.Writer` sentinel.
     pub const Error = Response.SendError;
 
-    fn init(res: *Response, buf: []u8) StreamingBodyWriter {
+    const vtable: std.Io.Writer.VTable = .{
+        .drain = drain,
+        .flush = flush,
+    };
+
+    fn init(res: *Response, buf: []u8, compressor: ?*StreamCompressor) StreamingBodyWriter {
         return .{
             .res = res,
-            .interface = .{ .buffer = buf, .vtable = &.{ .drain = StreamingBodyWriter.drain } },
+            .interface = .{ .buffer = buf, .vtable = &vtable },
+            .compressor = compressor,
         };
     }
 
@@ -446,54 +457,24 @@ pub const StreamingBodyWriter = struct {
             return w.consume(total);
         }
 
-        try self.record(if (self.res.chunked)
-            self.writeChunk(pending, data, splat, total)
-        else
-            self.writeBody(pending, data, splat));
+        if (self.compressor) |compressor| {
+            // Charged by the compressor for what it sends instead.
+            try self.record(compressor.write(pending, data, splat));
+            return w.consume(total);
+        }
+
+        try self.record(self.res.sendFramed(pending, data, splat, total));
         self.res.body_sent += total;
         return w.consume(total);
     }
 
-    fn writeParts(
-        out: *std.Io.Writer,
-        pending: []const u8,
-        data: []const []const u8,
-        splat: usize,
-    ) std.Io.Writer.Error!void {
-        try out.writeAll(pending);
-        for (data[0 .. data.len - 1]) |bytes| try out.writeAll(bytes);
-        const pattern = data[data.len - 1];
-        for (0..splat) |_| try out.writeAll(pattern);
-    }
-
-    /// Streams the body as-is, for a declared Content-Length.
-    fn writeBody(
-        self: *StreamingBodyWriter,
-        pending: []const u8,
-        data: []const []const u8,
-        splat: usize,
-    ) std.Io.Writer.Error!void {
-        const out = self.res.conn.writer;
-        try writeParts(out, pending, data, splat);
-        try out.flush();
-    }
-
-    fn writeChunk(
-        self: *StreamingBodyWriter,
-        pending: []const u8,
-        data: []const []const u8,
-        splat: usize,
-        total: usize,
-    ) std.Io.Writer.Error!void {
-        // 16 hex digits covers any usize, plus the CRLF.
-        var size_buf: [18]u8 = undefined;
-        const size = std.fmt.bufPrint(&size_buf, "{x}\r\n", .{total}) catch unreachable;
-
-        const out = self.res.conn.writer;
-        try out.writeAll(size);
-        try writeParts(out, pending, data, splat);
-        try out.writeAll("\r\n");
-        try out.flush();
+    /// A flush of a gzipped body has to reach through zlib, which would
+    /// otherwise hold on to what it was given until it had more.
+    fn flush(w: *std.Io.Writer) std.Io.Writer.Error!void {
+        const self: *StreamingBodyWriter = @alignCast(@fieldParentPtr("interface", w));
+        const compressor = self.compressor orelse return std.Io.Writer.defaultFlush(w);
+        try self.record(compressor.flush(w.buffered()));
+        w.end = 0;
     }
 
     /// Finishes the body: flushes what is left and, for a chunked body,
@@ -513,7 +494,12 @@ pub const StreamingBodyWriter = struct {
         // response.
         errdefer res.keepalive = false;
 
-        try res.resolve(self.interface.flush());
+        if (self.compressor) |compressor| {
+            try res.resolve(compressor.finish(self.interface.buffered()));
+            self.interface.end = 0;
+        } else {
+            try res.resolve(self.interface.flush());
+        }
         if (res.chunked and res.sendsBody()) try res.resolve(res.conn.writer.writeAll("0\r\n\r\n"));
         try res.resolve(res.conn.writer.flush());
         // Sending the wrong number of bytes for a declared length leaves
@@ -521,6 +507,66 @@ pub const StreamingBodyWriter = struct {
         if (res.content_length) |declared| {
             if (res.body_sent != declared) return error.ContentLengthMismatch;
         }
+    }
+};
+
+/// Gzips a streamed body between the handler and the framing: what the
+/// handler writes goes into `gzip`, and what that produces collects in
+/// `out` until there is a chunk's worth. Allocated from the arena, since
+/// `gzip` writes into `out` by pointer and the body writer holding this is
+/// returned by value.
+const StreamCompressor = struct {
+    res: *Response,
+    gzip: zlib.Compress,
+    out: std.Io.Writer,
+    out_buffer: [out_buffer_len]u8,
+
+    const out_buffer_len = 4096;
+
+    /// The length is not known up front, so the window cannot be fitted
+    /// to it: this is about 64K of arena, where zlib's defaults take 256K.
+    const options: zlib.Options = .{
+        .level = Response.compression_level,
+        .window_bits = 13,
+        .mem_level = 6,
+    };
+
+    fn create(res: *Response) std.mem.Allocator.Error!*StreamCompressor {
+        const self = try res.arena.create(StreamCompressor);
+        self.res = res;
+        self.out = .{ .buffer = &self.out_buffer, .vtable = &.{ .drain = drainOut } };
+        // Unbuffered: the body writer's buffer is in front of it already.
+        self.gzip = try .init(res.arena, &self.out, &.{}, .gzip, options);
+        return self;
+    }
+
+    fn write(self: *StreamCompressor, pending: []const u8, data: []const []const u8, splat: usize) std.Io.Writer.Error!void {
+        const w = &self.gzip.writer;
+        try w.writeAll(pending);
+        for (data[0 .. data.len - 1]) |bytes| try w.writeAll(bytes);
+        try w.splatBytesAll(data[data.len - 1], splat);
+    }
+
+    fn flush(self: *StreamCompressor, pending: []const u8) std.Io.Writer.Error!void {
+        try self.gzip.writer.writeAll(pending);
+        try self.gzip.writer.flush();
+        try self.out.flush();
+    }
+
+    fn finish(self: *StreamCompressor, pending: []const u8) std.Io.Writer.Error!void {
+        try self.gzip.writer.writeAll(pending);
+        try self.gzip.finish();
+        try self.out.flush();
+    }
+
+    fn drainOut(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const self: *StreamCompressor = @alignCast(@fieldParentPtr("out", w));
+        const pending = w.buffered();
+        const total = pending.len + std.Io.Writer.countSplat(data, splat);
+        if (total == 0) return 0;
+        try self.res.sendFramed(pending, data, splat, total);
+        self.res.body_sent += total;
+        return w.consume(total);
     }
 };
 
@@ -565,6 +611,21 @@ pub const Response = struct {
     content_length: ?usize = null,
     /// Body bytes handed to the connection by a streaming writer.
     body_sent: usize = 0,
+    /// The request this answers, when the server built the pair. Set by the
+    /// server.
+    request: ?*const Request = null,
+    /// Send the body gzipped if the request's `Accept-Encoding` allows it.
+    /// Settled with the headers: by `stream`, or by `write` for a buffered
+    /// body, which goes out as it is when it is short or does not shrink.
+    /// Ignored when the handler set its own `Content-Encoding`,
+    /// `Content-Length` or `Content-Range`.
+    ///
+    /// A strong `ETag` goes out weakened, as `W/"..."`, since the bytes
+    /// are no longer the ones it named, and that is the form a client
+    /// sends back in `If-None-Match`. A 304 is not compressed, so it does
+    /// not add `Vary: Accept-Encoding` or weaken an `ETag` on its own; a
+    /// handler answering one sets them as its 200 would have gone out.
+    compress: bool = false,
 
     /// What shaping a header can fail with. Nothing here touches the
     /// connection: a header set after the headers went out, a name or value
@@ -627,8 +688,24 @@ pub const Response = struct {
     /// them afterwards. Call `end` on the result before returning.
     pub fn stream(self: *Response, buf: []u8) !StreamingBodyWriter {
         self.startBody();
+        // Everything that can fail comes before anything is committed: a
+        // handler that gets an error from here still has open headers,
+        // and the error response written in their place must not inherit
+        // this one's framing or coding.
+        var declared: ?usize = null;
         if (self.headers.get("Content-Length")) |v| {
-            self.content_length = std.fmt.parseInt(usize, v, 10) catch return error.InvalidContentLength;
+            declared = std.fmt.parseInt(usize, v, 10) catch return error.InvalidContentLength;
+        }
+        const compression = if (declared == null) self.negotiateCompression() else null;
+        const compressor: ?*StreamCompressor = if (compression == true and self.sendsBody()) try .create(self) else null;
+        _ = try self.prepareHeader();
+
+        if (compression) |accepted| {
+            self.addVary();
+            if (accepted) self.markCompressed();
+        }
+        if (declared) |len| {
+            self.content_length = len;
         } else if (self.http10) {
             // Chunked encoding came with HTTP/1.1. Before it, a body of
             // unknown length ends when the connection does. A response
@@ -638,8 +715,8 @@ pub const Response = struct {
         } else {
             self.chunked = true;
         }
-        try self.writeHeader();
-        return .init(self, buf);
+        try self.resolve(self.sendHeaderAlone(self.conn.writer));
+        return .init(self, buf, compressor);
     }
 
     fn startBody(self: *Response) void {
@@ -674,13 +751,14 @@ pub const Response = struct {
         self.body = "";
         // Everything that described the old body has to go with it.
         // `content_type` is the usual way to set one, but a handler can
-        // write either header directly, and then a stale Content-Length
+        // write any of these directly, and then a stale Content-Length
         // is worse than a stale type: the headers go out with a length that
         // is already set left alone, so the peer would be told to read a body
         // of the wrong size and the connection would fall out of step.
         self.content_type = null;
         _ = self.headers.remove("Content-Type");
         _ = self.headers.remove("Content-Length");
+        _ = self.headers.remove("Content-Encoding");
     }
 
     pub fn json(self: *Response, value: anytype, options: std.json.Stringify.Options) !void {
@@ -704,9 +782,9 @@ pub const Response = struct {
     /// Opens a Server-Sent Events body.
     ///
     /// `buf` is what an event is assembled in before it goes at the
-    /// connection, and since the body is chunked it is also the chunk size.
-    /// One write per event is the point, so size it so an ordinary event
-    /// does not split across two.
+    /// connection, and since the body is chunked it is also the chunk size,
+    /// unless the body is compressed. One write per event is the point, so
+    /// size it so an ordinary event does not split across two.
     pub fn startEventStream(self: *Response, buf: []u8) !EventStream {
         try self.header("Content-Type", "text/event-stream");
         try self.header("Cache-Control", "no-cache");
@@ -789,6 +867,127 @@ pub const Response = struct {
         return !self.head and statusHasBody(self.status);
     }
 
+    const compression_level: zlib.Level = .default;
+
+    /// A buffered body shorter than this is sent as it is, without trying:
+    /// gzip adds 18 bytes of its own.
+    const min_compress_len = 128;
+
+    /// Whether compression applies to this response at all, and if so,
+    /// whether the client takes gzip. Either way, once it applies the
+    /// response varies by `Accept-Encoding`, whether or not this client
+    /// asked.
+    ///
+    /// Settles nothing: the headers that say so go on with `addVary` and
+    /// `markCompressed`, which have their room reserved here, so that
+    /// nothing fails after a response has started claiming a coding.
+    fn negotiateCompression(self: *const Response) ?bool {
+        if (!build_options.use_zlib or !self.compress) return null;
+        if (!statusHasBody(self.status) or self.status == .partial_content) return null;
+        // The handler framed, coded or cut the body itself.
+        if (self.headers.get("Content-Encoding") != null) return null;
+        if (self.headers.get("Content-Length") != null) return null;
+        if (self.headers.get("Content-Range") != null) return null;
+
+        // Content-Encoding, Vary if it is not there yet, and the
+        // Content-Type `prepareHeader` adds after this. Without the room
+        // the body goes out as it is, which no cache can get wrong.
+        var needed: usize = 1;
+        if (!self.variesByAcceptEncoding()) needed += 1;
+        if (self.content_type != null and self.headers.get("Content-Type") == null) needed += 1;
+        if (self.headers.keys.len - self.headers.len < needed) return null;
+
+        const request = self.request orelse return false;
+        const accept = request.headers.get("Accept-Encoding") orelse return false;
+        return http.acceptsGzip(accept);
+    }
+
+    fn variesByAcceptEncoding(self: *const Response) bool {
+        var it = self.headers.iterator();
+        while (it.next()) |entry| {
+            if (!std.ascii.eqlIgnoreCase(entry.key, "Vary")) continue;
+            if (std.ascii.indexOfIgnoreCase(entry.value, "accept-encoding") != null) return true;
+        }
+        return false;
+    }
+
+    fn addVary(self: *Response) void {
+        if (self.variesByAcceptEncoding()) return;
+        self.headers.add("Vary", "Accept-Encoding") catch unreachable; // reserved
+    }
+
+    /// Says the body is gzipped. A strong `ETag` promises the same bytes as
+    /// the uncompressed body would have, so it is weakened, or dropped if
+    /// there is no memory to weaken it with.
+    fn markCompressed(self: *Response) void {
+        if (self.headers.get("ETag")) |etag| {
+            if (!std.mem.startsWith(u8, etag, "W/")) {
+                if (std.fmt.allocPrint(self.arena, "W/{s}", .{etag})) |weak| {
+                    self.headers.put("ETag", weak) catch unreachable; // replaces
+                } else |_| {
+                    _ = self.headers.remove("ETag");
+                }
+            }
+        }
+        self.headers.add("Content-Encoding", "gzip") catch unreachable; // reserved
+    }
+
+    /// Replaces the buffered body with its gzipped form, unless it is short
+    /// or would not shrink. A failure to allocate sends the body as it was.
+    fn compressBody(self: *Response) void {
+        const len = self.bodyLen();
+        if (len < min_compress_len) return;
+        const buffer = self.body_buffer;
+        const body = self.body;
+        if (self.deflateBody(buffer, body, len)) {
+            if (self.bodyLen() < len) return self.markCompressed();
+        } else |_| {}
+        self.body_buffer = buffer;
+        self.body = body;
+    }
+
+    fn deflateBody(self: *Response, buffer: BodyBuffer, body: []const u8, len: usize) (std.mem.Allocator.Error || std.Io.Writer.Error)!void {
+        self.body_buffer = try .init(self.arena);
+        self.body = "";
+        var out: BodyWriter = .init(self);
+        // Sized to the body, and zlib's memory with it: a window much past
+        // the body finds nothing more to match.
+        const window_bits: u4 = @intCast(std.math.clamp(std.math.log2_int_ceil(usize, len), 9, 15));
+        var gzip = try zlib.Compress.init(self.arena, &out.interface, &.{}, .gzip, .{
+            .level = compression_level,
+            .window_bits = window_bits,
+            // Any less and the symbol buffer ends deflate blocks early
+            // enough to cost a few percent on bodies of about 512 bytes.
+            .mem_level = @min(window_bits - 6, 8),
+        });
+        defer gzip.deinit();
+        if (buffer.len() > 0) try buffer.writeTo(&gzip.writer) else try gzip.writer.writeAll(body);
+        try gzip.finish();
+        try out.interface.flush();
+    }
+
+    /// Body bytes on the wire, framed as the headers said: a chunk, or as
+    /// they are.
+    fn sendFramed(
+        self: *Response,
+        pending: []const u8,
+        data: []const []const u8,
+        splat: usize,
+        total: usize,
+    ) std.Io.Writer.Error!void {
+        const out = self.conn.writer;
+        if (self.chunked) {
+            // 16 hex digits covers any usize, plus the CRLF.
+            var size_buf: [18]u8 = undefined;
+            try out.writeAll(std.fmt.bufPrint(&size_buf, "{x}\r\n", .{total}) catch unreachable);
+        }
+        try out.writeAll(pending);
+        for (data[0 .. data.len - 1]) |bytes| try out.writeAll(bytes);
+        try out.splatBytesAll(data[data.len - 1], splat);
+        if (self.chunked) try out.writeAll("\r\n");
+        try out.flush();
+    }
+
     /// Sends the headers ahead of a body that is not buffered: a stream,
     /// or a protocol upgrade. A buffered body goes out with its headers in
     /// `write`, once its length is known.
@@ -862,7 +1061,8 @@ pub const Response = struct {
             // promised, and the connection must not be reused -- the peer
             // would read the next response as this body. A chunked body
             // needs no such care: `sendBody` terminates it, and a
-            // truncated but well framed body is one the peer can finish.
+            // truncated but well framed body is one the peer can finish,
+            // though a gzipped one will not decode to the end.
             if (self.headers_written and !self.chunked) {
                 if (self.content_length) |declared| {
                     if (self.body_sent != declared) self.keepalive = false;
@@ -873,6 +1073,13 @@ pub const Response = struct {
             // built a replacement has already cleared it.
         }
         self.written = true;
+
+        if (!self.headers_written) {
+            if (self.negotiateCompression()) |accepted| {
+                self.addVary();
+                if (accepted) self.compressBody();
+            }
+        }
 
         // Already false for a chunked response: the streaming writer
         // settled the headers when it sent them.
@@ -2779,4 +2986,66 @@ test "Response: a HEAD event stream sends the headers and no events" {
     try std.testing.expect(std.mem.indexOf(u8, written, "hello") == null);
     try std.testing.expect(std.mem.indexOf(u8, written, "tick") == null);
     try std.testing.expect(std.mem.indexOf(u8, written, "data:") == null);
+}
+
+fn testGzipRequest(arena: std.mem.Allocator) !Request {
+    var request: Request = .{ .arena = arena, .parser = undefined, .transport = undefined };
+    request.headers = try http.Headers.init(arena, 4);
+    try request.headers.put("Accept-Encoding", "gzip");
+    return request;
+}
+
+test "Response: a stream refused at the headers leaves nothing for the error response" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var buf: [1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+
+    const request = try testGzipRequest(arena.allocator());
+    var response = try Response.init(arena.allocator(), &connection, 2);
+    response.request = &request;
+    response.compress = true;
+    response.content_type = .text;
+    try response.header("X-A", "1");
+    try response.header("X-B", "2");
+
+    var stream_buf: [64]u8 = undefined;
+    try std.testing.expectError(error.TooManyHeaders, response.stream(&stream_buf));
+
+    // What `handleError` does with headers that are still open.
+    response.resetBody();
+    response.status = .internal_server_error;
+    response.body = "oops";
+    try response.write();
+
+    const written = conn_writer.buffered();
+    try std.testing.expect(std.mem.startsWith(u8, written, "HTTP/1.1 500"));
+    try std.testing.expect(std.mem.indexOf(u8, written, "Transfer-Encoding") == null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "Content-Encoding") == null);
+    try std.testing.expect(std.mem.endsWith(u8, written, "\r\n\r\noops"));
+}
+
+test "Response: compress without room for its headers sends the body as it is" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var buf: [1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+
+    const request = try testGzipRequest(arena.allocator());
+    var response = try Response.init(arena.allocator(), &connection, 1);
+    response.request = &request;
+    response.compress = true;
+    response.body = "a" ** 300;
+    try response.write();
+
+    const written = conn_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, written, "Content-Encoding") == null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "Vary") == null);
+    try std.testing.expect(std.mem.endsWith(u8, written, "\r\n\r\n" ++ "a" ** 300));
 }
