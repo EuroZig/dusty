@@ -904,8 +904,7 @@ pub const Response = struct {
         if (self.headers.keys.len - self.headers.len < needed) return null;
 
         const request = self.request orelse return false;
-        const accept = request.headers.get("Accept-Encoding") orelse return false;
-        return http.acceptsGzip(accept);
+        return http.acceptsGzip(&request.headers);
     }
 
     /// `Vary: *` included, which says the response varies by anything.
