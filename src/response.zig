@@ -707,7 +707,7 @@ pub const Response = struct {
         if (self.headers.get("Content-Length")) |v| {
             declared = std.fmt.parseInt(usize, v, 10) catch return error.InvalidContentLength;
         }
-        var compression = if (declared == null) self.negotiateCompression() else null;
+        var compression = self.negotiateCompression();
         // Without the memory for a compressor the body goes out as it is,
         // as a buffered one does.
         const compressor: ?*StreamCompressor = if (compression == true and self.sendsBody())
