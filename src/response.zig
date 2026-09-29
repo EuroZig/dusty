@@ -303,6 +303,8 @@ const BodyBuffer = struct {
 /// produced. Either way, `end` must be called before the handler returns.
 pub const BodyWriter = struct {
     res: *Response,
+    /// Where the bytes go: the response's body, or a buffer built beside it.
+    buffer: *BodyBuffer,
     interface: std.Io.Writer,
     /// The real cause behind the generic `error.WriteFailed`. Nothing here
     /// talks to the connection, so this is an allocation failure.
@@ -317,9 +319,14 @@ pub const BodyWriter = struct {
     };
 
     fn init(res: *Response) BodyWriter {
-        const segment = res.body_buffer.last();
+        return .into(res, &res.body_buffer);
+    }
+
+    fn into(res: *Response, buffer: *BodyBuffer) BodyWriter {
+        const segment = buffer.last();
         return .{
             .res = res,
+            .buffer = buffer,
             .interface = .{
                 .buffer = if (segment) |seg| seg.bytes() else &.{},
                 .end = if (segment) |seg| seg.len else 0,
@@ -339,7 +346,7 @@ pub const BodyWriter = struct {
         needed = std.math.add(usize, needed, splat_len) catch return self.fail(error.OutOfMemory);
         // Called only when `data` does not fit in what is left, so move on
         // to a segment it does fit in.
-        self.res.body_buffer.nextSegment(self.res.arena, w, needed, 0) catch |err| return self.fail(err);
+        self.buffer.nextSegment(self.res.arena, w, needed, 0) catch |err| return self.fail(err);
 
         const start = w.end;
         for (data[0 .. data.len - 1]) |bytes| {
@@ -362,14 +369,14 @@ pub const BodyWriter = struct {
 
     fn rebase(w: *std.Io.Writer, preserve: usize, minimum_len: usize) std.Io.Writer.Error!void {
         const self: *BodyWriter = @alignCast(@fieldParentPtr("interface", w));
-        self.res.body_buffer.nextSegment(self.res.arena, w, minimum_len, preserve) catch |err| return self.fail(err);
+        self.buffer.nextSegment(self.res.arena, w, minimum_len, preserve) catch |err| return self.fail(err);
     }
 
     /// The segments are the storage, so there is nothing to send: flushing
-    /// tells the response how much of the current one is written.
+    /// tells the buffer how much of the current one is written.
     fn flush(w: *std.Io.Writer) std.Io.Writer.Error!void {
         const self: *BodyWriter = @alignCast(@fieldParentPtr("interface", w));
-        if (self.res.body_buffer.last()) |segment| segment.len = w.end;
+        if (self.buffer.last()) |segment| segment.len = w.end;
     }
 
     fn fail(self: *BodyWriter, err: Error) std.Io.Writer.Error {
@@ -963,19 +970,16 @@ pub const Response = struct {
     fn compressBody(self: *Response) void {
         const len = self.bodyLen();
         if (len < min_compress_len) return;
-        const buffer = self.body_buffer;
-        const body = self.body;
-        if (self.deflateBody(buffer, body, len)) {
-            if (self.bodyLen() < len) return self.markCompressed();
-        } else |_| {}
-        self.body_buffer = buffer;
-        self.body = body;
+        const compressed = self.deflateBody(len) catch return;
+        if (compressed.len() >= len) return;
+        self.body_buffer = compressed;
+        self.body = "";
+        self.markCompressed();
     }
 
-    fn deflateBody(self: *Response, buffer: BodyBuffer, body: []const u8, len: usize) (std.mem.Allocator.Error || std.Io.Writer.Error)!void {
-        self.body_buffer = try .init(self.arena);
-        self.body = "";
-        var out: BodyWriter = .init(self);
+    fn deflateBody(self: *Response, len: usize) (std.mem.Allocator.Error || std.Io.Writer.Error)!BodyBuffer {
+        var compressed: BodyBuffer = try .init(self.arena);
+        var out: BodyWriter = .into(self, &compressed);
         // Sized to the body, and zlib's memory with it: a window much past
         // the body finds nothing more to match.
         const window_bits: u4 = @intCast(std.math.clamp(std.math.log2_int_ceil(usize, len), 9, 15));
@@ -987,9 +991,10 @@ pub const Response = struct {
             .mem_level = @min(window_bits - 6, 8),
         });
         defer gzip.deinit();
-        if (buffer.len() > 0) try buffer.writeTo(&gzip.writer) else try gzip.writer.writeAll(body);
+        if (self.body_buffer.len() > 0) try self.body_buffer.writeTo(&gzip.writer) else try gzip.writer.writeAll(self.body);
         try gzip.finish();
         try out.interface.flush();
+        return compressed;
     }
 
     /// Body bytes on the wire, framed as the headers said: a chunk, or as
