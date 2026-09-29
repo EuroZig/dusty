@@ -707,6 +707,7 @@ pub const Response = struct {
         if (self.headers.get("Content-Length")) |v| {
             declared = std.fmt.parseInt(usize, v, 10) catch return error.InvalidContentLength;
         }
+        try self.applyContentType();
         var compression = self.negotiateCompression();
         // Without the memory for a compressor the body goes out as it is,
         // as a buffered one does.
@@ -717,7 +718,7 @@ pub const Response = struct {
             }
         else
             null;
-        _ = try self.prepareHeader();
+        self.headers_written = true;
 
         if (compression != .off) self.addVary();
         if (compression == .gzip) self.markCompressed();
@@ -863,19 +864,13 @@ pub const Response = struct {
         };
     }
 
-    /// Settles the headers: applies `content_type` and marks them sent.
-    /// Returns whether they still have to go on the wire -- false once
-    /// something else has already put them there.
-    fn prepareHeader(self: *Response) HeaderError!bool {
-        if (self.headers_written) return false;
-
-        // Set the Content-Type header. Before the flag, so it goes through
-        // the same door as every other header rather than around it.
+    /// Puts `content_type` into the headers. Before `headers_written` is
+    /// set, so it goes through the same door as every other header rather
+    /// than around it.
+    fn applyContentType(self: *Response) HeaderError!void {
         if (self.content_type) |content_type| {
             try self.header("Content-Type", content_type.toContentType());
         }
-        self.headers_written = true;
-        return true;
     }
 
     /// A HEAD sends none of its body, and neither does a status that has
@@ -916,12 +911,11 @@ pub const Response = struct {
         if (self.headers.get("Content-Length") != null) return .off;
         if (self.headers.get("Content-Range") != null) return .off;
 
-        // Content-Encoding, except on a 304, Vary if it is not there yet,
-        // and the Content-Type `prepareHeader` adds after this. Without the
-        // room the body goes out as it is, which no cache can get wrong.
+        // Content-Encoding, except on a 304, and Vary if it is not there
+        // yet. Without the room the body goes out as it is, which no cache
+        // can get wrong.
         var needed: usize = if (not_modified) 0 else 1;
         if (!self.variesByAcceptEncoding()) needed += 1;
-        if (self.content_type != null and self.headers.get("Content-Type") == null) needed += 1;
         if (self.headers.keys.len - self.headers.len < needed) return .off;
 
         const request = self.request orelse return .identity;
@@ -1029,7 +1023,9 @@ pub const Response = struct {
     /// or a protocol upgrade. A buffered body goes out with its headers in
     /// `write`, once its length is known.
     fn writeHeader(self: *Response) WriteError!void {
-        if (!try self.prepareHeader()) return;
+        if (self.headers_written) return;
+        try self.applyContentType();
+        self.headers_written = true;
         return self.resolve(self.sendHeaderAlone(self.conn.writer));
     }
 
@@ -1111,17 +1107,19 @@ pub const Response = struct {
         }
         self.written = true;
 
-        if (!self.headers_written) {
+        // Already false for a chunked response: the streaming writer
+        // settled the headers when it sent them.
+        const send_header = !self.headers_written;
+        if (send_header) {
+            try self.applyContentType();
             const compression = self.negotiateCompression();
             if (compression != .off) self.addVary();
             if (compression == .gzip) {
                 if (self.status == .not_modified) self.markCompressed() else self.compressBody();
             }
+            self.headers_written = true;
         }
 
-        // Already false for a chunked response: the streaming writer
-        // settled the headers when it sent them.
-        const send_header = try self.prepareHeader();
         // A length promised by a Content-Length the handler set itself: a
         // body of another length cannot be framed as promised, and the
         // connection cannot carry another response after it.
