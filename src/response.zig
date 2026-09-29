@@ -700,8 +700,16 @@ pub const Response = struct {
         if (self.headers.get("Content-Length")) |v| {
             declared = std.fmt.parseInt(usize, v, 10) catch return error.InvalidContentLength;
         }
-        const compression = if (declared == null) self.negotiateCompression() else null;
-        const compressor: ?*StreamCompressor = if (compression == true and self.sendsBody()) try .create(self) else null;
+        var compression = if (declared == null) self.negotiateCompression() else null;
+        // Without the memory for a compressor the body goes out as it is,
+        // as a buffered one does.
+        const compressor: ?*StreamCompressor = if (compression == true and self.sendsBody())
+            StreamCompressor.create(self) catch blk: {
+                compression = false;
+                break :blk null;
+            }
+        else
+            null;
         _ = try self.prepareHeader();
 
         if (compression) |accepted| {
@@ -3134,4 +3142,32 @@ test "Response: variesByAcceptEncoding matches whole names, and *" {
         try response.header("Vary", case[0]);
         try std.testing.expectEqual(case[1], response.variesByAcceptEncoding());
     }
+}
+
+test "Response: a stream without the memory for a compressor goes out as it is" {
+    if (!build_options.use_zlib) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var failing = std.testing.FailingAllocator.init(arena.allocator(), .{});
+
+    var buf: [1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+
+    const request = try testGzipRequest(arena.allocator());
+    var response = try Response.init(failing.allocator(), &connection, 8);
+    response.request = &request;
+    response.compress = true;
+    failing.fail_index = failing.alloc_index;
+
+    var stream_buf: [64]u8 = undefined;
+    var w = try response.stream(&stream_buf);
+    try w.interface.writeAll("hello");
+    try w.end();
+
+    const written = conn_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, written, "Vary: Accept-Encoding\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "Content-Encoding") == null);
+    try std.testing.expect(std.mem.endsWith(u8, written, "\r\n\r\n5\r\nhello\r\n0\r\n\r\n"));
 }
