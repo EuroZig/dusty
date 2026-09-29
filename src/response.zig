@@ -908,11 +908,16 @@ pub const Response = struct {
         return http.acceptsGzip(accept);
     }
 
+    /// `Vary: *` included, which says the response varies by anything.
     fn variesByAcceptEncoding(self: *const Response) bool {
         var it = self.headers.iterator();
         while (it.next()) |entry| {
             if (!std.ascii.eqlIgnoreCase(entry.key, "Vary")) continue;
-            if (std.ascii.indexOfIgnoreCase(entry.value, "accept-encoding") != null) return true;
+            var names = std.mem.splitScalar(u8, entry.value, ',');
+            while (names.next()) |item| {
+                const name = std.mem.trim(u8, item, " \t");
+                if (std.mem.eql(u8, name, "*") or std.ascii.eqlIgnoreCase(name, "Accept-Encoding")) return true;
+            }
         }
         return false;
     }
@@ -3113,4 +3118,21 @@ test "Response: a 304 gets the Vary and ETag of a gzipped 200, without its codin
     try std.testing.expect(std.mem.indexOf(u8, written, "Vary: Accept-Encoding\r\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "ETag: W/\"v1\"\r\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "Content-Encoding") == null);
+}
+
+test "Response: variesByAcceptEncoding matches whole names, and *" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var connection: Connection = undefined;
+
+    const cases = [_]struct { []const u8, bool }{
+        .{ "Origin, accept-encoding", true },
+        .{ "*", true },
+        .{ "X-Accept-Encoding-Hint", false },
+    };
+    for (cases) |case| {
+        var response = try Response.init(arena.allocator(), &connection, 2);
+        try response.header("Vary", case[0]);
+        try std.testing.expectEqual(case[1], response.variesByAcceptEncoding());
+    }
 }
