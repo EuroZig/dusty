@@ -710,19 +710,17 @@ pub const Response = struct {
         var compression = self.negotiateCompression();
         // Without the memory for a compressor the body goes out as it is,
         // as a buffered one does.
-        const compressor: ?*StreamCompressor = if (compression == true and self.sendsBody())
+        const compressor: ?*StreamCompressor = if (compression == .gzip and self.sendsBody())
             StreamCompressor.create(self) catch blk: {
-                compression = false;
+                compression = .identity;
                 break :blk null;
             }
         else
             null;
         _ = try self.prepareHeader();
 
-        if (compression) |accepted| {
-            self.addVary();
-            if (accepted) self.markCompressed();
-        }
+        if (compression != .off) self.addVary();
+        if (compression == .gzip) self.markCompressed();
         if (declared) |len| {
             self.content_length = len;
         } else if (self.http10) {
@@ -892,23 +890,31 @@ pub const Response = struct {
     /// gzip adds 18 bytes of its own.
     const min_compress_len = 128;
 
+    /// What `negotiateCompression` settled on.
+    const Compression = enum {
+        /// Not asked for, or not for this response.
+        off,
+        /// Applies, but this client does not take gzip. The response still
+        /// varies by `Accept-Encoding`.
+        identity,
+        gzip,
+    };
+
     /// Whether compression applies to this response at all, and if so,
-    /// whether the client takes gzip. Either way, once it applies the
-    /// response varies by `Accept-Encoding`, whether or not this client
-    /// asked.
+    /// whether the client takes gzip.
     ///
     /// Settles nothing: the headers that say so go on with `addVary` and
     /// `markCompressed`, which have their room reserved here, so that
     /// nothing fails after a response has started claiming a coding.
-    fn negotiateCompression(self: *const Response) ?bool {
-        if (!build_options.use_zlib or !self.compress) return null;
+    fn negotiateCompression(self: *const Response) Compression {
+        if (!build_options.use_zlib or !self.compress) return .off;
         const not_modified = self.status == .not_modified;
-        if (!not_modified and !statusHasBody(self.status)) return null;
-        if (self.status == .partial_content) return null;
+        if (!not_modified and !statusHasBody(self.status)) return .off;
+        if (self.status == .partial_content) return .off;
         // The handler framed, coded or cut the body itself.
-        if (self.headers.get("Content-Encoding") != null) return null;
-        if (self.headers.get("Content-Length") != null) return null;
-        if (self.headers.get("Content-Range") != null) return null;
+        if (self.headers.get("Content-Encoding") != null) return .off;
+        if (self.headers.get("Content-Length") != null) return .off;
+        if (self.headers.get("Content-Range") != null) return .off;
 
         // Content-Encoding, except on a 304, Vary if it is not there yet,
         // and the Content-Type `prepareHeader` adds after this. Without the
@@ -916,10 +922,10 @@ pub const Response = struct {
         var needed: usize = if (not_modified) 0 else 1;
         if (!self.variesByAcceptEncoding()) needed += 1;
         if (self.content_type != null and self.headers.get("Content-Type") == null) needed += 1;
-        if (self.headers.keys.len - self.headers.len < needed) return null;
+        if (self.headers.keys.len - self.headers.len < needed) return .off;
 
-        const request = self.request orelse return false;
-        return http.acceptsGzip(&request.headers);
+        const request = self.request orelse return .identity;
+        return if (http.acceptsGzip(&request.headers)) .gzip else .identity;
     }
 
     /// `Vary: *` included, which says the response varies by anything.
@@ -1106,11 +1112,10 @@ pub const Response = struct {
         self.written = true;
 
         if (!self.headers_written) {
-            if (self.negotiateCompression()) |accepted| {
-                self.addVary();
-                if (accepted) {
-                    if (self.status == .not_modified) self.markCompressed() else self.compressBody();
-                }
+            const compression = self.negotiateCompression();
+            if (compression != .off) self.addVary();
+            if (compression == .gzip) {
+                if (self.status == .not_modified) self.markCompressed() else self.compressBody();
             }
         }
 
