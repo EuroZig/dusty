@@ -623,10 +623,12 @@ pub const Response = struct {
     /// A strong `ETag` goes out weakened, as `W/"..."`, since the bytes
     /// are no longer the ones it named, and that is the form a client
     /// sends back in `If-None-Match`. `Accept-Ranges` is dropped, since a
-    /// range would be taken of the gzipped bytes. A 304 is not compressed,
-    /// so it does not add `Vary: Accept-Encoding` or weaken an `ETag` on
-    /// its own; a handler answering one sets them as its 200 would have
-    /// gone out.
+    /// range would be taken of the gzipped bytes.
+    ///
+    /// A 304 has no body, but gets the `Vary` and `ETag` of the 200 it
+    /// stands in for, assuming that one was gzipped: a 200 short enough
+    /// to go out as it was kept its `ETag` strong, which still matches the
+    /// weak one under the weak comparison `If-None-Match` uses.
     compress: bool = false,
 
     /// What shaping a header can fail with. Nothing here touches the
@@ -885,16 +887,18 @@ pub const Response = struct {
     /// nothing fails after a response has started claiming a coding.
     fn negotiateCompression(self: *const Response) ?bool {
         if (!build_options.use_zlib or !self.compress) return null;
-        if (!statusHasBody(self.status) or self.status == .partial_content) return null;
+        const not_modified = self.status == .not_modified;
+        if (!not_modified and !statusHasBody(self.status)) return null;
+        if (self.status == .partial_content) return null;
         // The handler framed, coded or cut the body itself.
         if (self.headers.get("Content-Encoding") != null) return null;
         if (self.headers.get("Content-Length") != null) return null;
         if (self.headers.get("Content-Range") != null) return null;
 
-        // Content-Encoding, Vary if it is not there yet, and the
-        // Content-Type `prepareHeader` adds after this. Without the room
-        // the body goes out as it is, which no cache can get wrong.
-        var needed: usize = 1;
+        // Content-Encoding, except on a 304, Vary if it is not there yet,
+        // and the Content-Type `prepareHeader` adds after this. Without the
+        // room the body goes out as it is, which no cache can get wrong.
+        var needed: usize = if (not_modified) 0 else 1;
         if (!self.variesByAcceptEncoding()) needed += 1;
         if (self.content_type != null and self.headers.get("Content-Type") == null) needed += 1;
         if (self.headers.keys.len - self.headers.len < needed) return null;
@@ -923,6 +927,10 @@ pub const Response = struct {
     /// there is no memory to weaken it with. `Accept-Ranges` goes too: a
     /// range would be taken of the gzipped bytes, which the handler's own
     /// range support knows nothing about.
+    ///
+    /// A 304 gets the validators of the gzipped 200 it stands in for, but
+    /// no `Content-Encoding`: RFC 9110 §15.4.5 leaves representation
+    /// metadata off it.
     fn markCompressed(self: *Response) void {
         _ = self.headers.remove("Accept-Ranges");
         if (self.headers.get("ETag")) |etag| {
@@ -934,6 +942,7 @@ pub const Response = struct {
                 }
             }
         }
+        if (self.status == .not_modified) return;
         self.headers.add("Content-Encoding", "gzip") catch unreachable; // reserved
     }
 
@@ -1082,7 +1091,9 @@ pub const Response = struct {
         if (!self.headers_written) {
             if (self.negotiateCompression()) |accepted| {
                 self.addVary();
-                if (accepted) self.compressBody();
+                if (accepted) {
+                    if (self.status == .not_modified) self.markCompressed() else self.compressBody();
+                }
             }
         }
 
@@ -3078,4 +3089,28 @@ test "Response: a gzipped body weakens its ETag and drops Accept-Ranges" {
     try std.testing.expect(std.mem.indexOf(u8, written, "Content-Encoding: gzip\r\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "ETag: W/\"v1\"\r\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "Accept-Ranges") == null);
+}
+
+test "Response: a 304 gets the Vary and ETag of a gzipped 200, without its coding" {
+    if (!build_options.use_zlib) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var buf: [1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+
+    const request = try testGzipRequest(arena.allocator());
+    var response = try Response.init(arena.allocator(), &connection, 8);
+    response.request = &request;
+    response.compress = true;
+    response.status = .not_modified;
+    try response.header("ETag", "\"v1\"");
+    try response.write();
+
+    const written = conn_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, written, "Vary: Accept-Encoding\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "ETag: W/\"v1\"\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "Content-Encoding") == null);
 }
