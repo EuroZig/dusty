@@ -1435,3 +1435,91 @@ test "Client: redirects share the request's budget" {
     defer response.deinit();
     try std.testing.expectEqualStrings("done", (try response.body()).?);
 }
+
+test "Server: res.compress gzips buffered and streamed bodies for a client that accepts it" {
+    if (!@import("build_options").use_zlib) return error.SkipZigTest;
+    const io = std.testing.io;
+
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listen = loopback }, {});
+    defer server.deinit();
+
+    const Handlers = struct {
+        const line = "the quick brown fox jumps over the lazy dog\n";
+
+        fn buffered(_: *dusty.Request, res: *dusty.Response) !void {
+            res.compress = true;
+            var w = res.writer();
+            for (0..100) |_| try w.interface.writeAll(line);
+            try w.end();
+        }
+
+        fn streamed(_: *dusty.Request, res: *dusty.Response) !void {
+            res.compress = true;
+            var buf: [256]u8 = undefined;
+            var w = try res.stream(&buf);
+            for (0..50) |_| try w.interface.writeAll(line);
+            try w.interface.flush();
+            for (0..50) |_| try w.interface.writeAll(line);
+            try w.end();
+        }
+
+        fn events(_: *dusty.Request, res: *dusty.Response) !void {
+            res.compress = true;
+            var buf: [256]u8 = undefined;
+            var stream = try res.startEventStream(&buf);
+            for (0..3) |_| try stream.send(line, .{ .event = "fox" });
+            try stream.body.end();
+        }
+
+        fn short(_: *dusty.Request, res: *dusty.Response) !void {
+            res.compress = true;
+            res.body = line;
+        }
+    };
+    server.router.get("/buffered", Handlers.buffered);
+    server.router.get("/streamed", Handlers.streamed);
+    server.router.get("/short", Handlers.short);
+    server.router.get("/events", Handlers.events);
+
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+
+    var client_future = try io.concurrent(struct {
+        fn fetch(client: *dusty.Client, port: u16, path: []const u8, identity: bool, encoding: dusty.ContentEncoding, expected: []const u8) !void {
+            var url_buf: [64]u8 = undefined;
+            const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}{s}", .{ port, path });
+            var headers = try dusty.Headers.init(std.testing.allocator, 4);
+            defer headers.deinit(std.testing.allocator);
+            if (identity) try headers.put("Accept-Encoding", "identity");
+
+            var response = try client.fetch(url, .{ .headers = &headers });
+            defer response.deinit();
+            try std.testing.expectEqual(encoding, response.contentEncoding());
+            try std.testing.expectEqualStrings("Accept-Encoding", response.headers().get("Vary").?);
+            try std.testing.expectEqualStrings(expected, (try response.body()).?);
+        }
+
+        fn run(s: *dusty.Server(void), _io: std.Io) !void {
+            try s.ready.wait(_io);
+            const port = s.address.ip.getPort();
+
+            var client = dusty.Client.init(std.testing.allocator, _io, .{});
+            defer client.deinit();
+
+            const long = Handlers.line ** 100;
+            try fetch(&client, port, "/buffered", false, .gzip, long);
+            try fetch(&client, port, "/streamed", false, .gzip, long);
+            try fetch(&client, port, "/short", false, .identity, Handlers.line);
+            const event = "event: fox\ndata: the quick brown fox jumps over the lazy dog\ndata: \n\n";
+            try fetch(&client, port, "/events", false, .gzip, event ** 3);
+            try fetch(&client, port, "/buffered", true, .identity, long);
+            try fetch(&client, port, "/streamed", true, .identity, long);
+        }
+    }.run, .{ &server, io });
+
+    try client_future.await(io);
+}

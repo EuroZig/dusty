@@ -9,6 +9,7 @@ or if you are using WebSocket. However, it's usable with any implementation, lik
 - Supports HTTP/1.0 and HTTP/1.1
 - Supports chunked transfer encoding in both request/response bodies
 - Transparent gzip/deflate decoding of request and response bodies
+- gzip compression of response bodies, opt-in per response with `res.compress = true`
 - Server-Sent Events (SSE) for streaming responses
 - WebSocket support (RFC 6455)
 - HTTP/HTTPS client with connection pooling

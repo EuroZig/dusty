@@ -20,6 +20,7 @@ pub const Status = @import("http.zig").Status;
 pub const Headers = @import("http.zig").Headers;
 pub const Params = @import("http.zig").Params;
 pub const ContentType = @import("http.zig").ContentType;
+pub const ContentEncoding = @import("http.zig").ContentEncoding;
 pub const Cookie = @import("cookie.zig").Cookie;
 pub const CookieOpts = @import("cookie.zig").CookieOpts;
 pub const validateCookieName = @import("cookie.zig").validateCookieName;

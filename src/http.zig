@@ -748,6 +748,69 @@ pub const ContentEncoding = enum {
     }
 };
 
+/// Whether the request's `Accept-Encoding` (RFC 9110 §12.5.3) lets a
+/// response be sent gzipped: gzip, or failing that `*`, listed without
+/// `q=0`. A field sent on several lines is one list.
+pub fn acceptsGzip(headers: *const Headers) bool {
+    var wildcard = false;
+    var fields = headers.iterator();
+    while (fields.next()) |field| {
+        if (!std.ascii.eqlIgnoreCase(field.key, "Accept-Encoding")) continue;
+        var it = std.mem.splitScalar(u8, field.value, ',');
+        while (it.next()) |item| {
+            var parts = std.mem.splitScalar(u8, item, ';');
+            const coding = std.mem.trim(u8, parts.first(), " \t");
+            var accepted = true;
+            while (parts.next()) |part| {
+                const param = std.mem.trim(u8, part, " \t");
+                if (param.len >= 2 and (param[0] == 'q' or param[0] == 'Q') and param[1] == '=') {
+                    accepted = !isZeroQuality(std.mem.trim(u8, param[2..], " \t"));
+                }
+            }
+            if (ContentEncoding.fromString(coding) == .gzip) return accepted;
+            if (std.mem.eql(u8, coding, "*")) wildcard = accepted;
+        }
+    }
+    return wildcard;
+}
+
+/// "0", "0.", "0.0" up to "0.000".
+fn isZeroQuality(value: []const u8) bool {
+    if (value.len == 0 or value[0] != '0') return false;
+    if (value.len == 1) return true;
+    if (value[1] != '.') return false;
+    for (value[2..]) |ch| if (ch != '0') return false;
+    return true;
+}
+
+fn testAcceptsGzip(values: []const []const u8) !bool {
+    var headers = try Headers.init(std.testing.allocator, 4);
+    defer headers.deinit(std.testing.allocator);
+    try headers.add("Host", "example.com");
+    for (values) |value| try headers.add("Accept-Encoding", value);
+    return acceptsGzip(&headers);
+}
+
+test "acceptsGzip" {
+    try std.testing.expect(try testAcceptsGzip(&.{"gzip"}));
+    try std.testing.expect(try testAcceptsGzip(&.{"deflate, gzip;q=0.5, br"}));
+    try std.testing.expect(try testAcceptsGzip(&.{"x-gzip"}));
+    try std.testing.expect(try testAcceptsGzip(&.{"GZIP ; Q=1"}));
+    try std.testing.expect(try testAcceptsGzip(&.{"*"}));
+    try std.testing.expect(try testAcceptsGzip(&.{"br, *;q=0.1"}));
+    try std.testing.expect(!try testAcceptsGzip(&.{""}));
+    try std.testing.expect(!try testAcceptsGzip(&.{"identity"}));
+    try std.testing.expect(!try testAcceptsGzip(&.{"deflate, br"}));
+    try std.testing.expect(!try testAcceptsGzip(&.{"gzip;q=0"}));
+    try std.testing.expect(!try testAcceptsGzip(&.{"gzip;q=0.000"}));
+    try std.testing.expect(!try testAcceptsGzip(&.{"*, gzip;q=0"}));
+    try std.testing.expect(!try testAcceptsGzip(&.{"*;q=0"}));
+    try std.testing.expect(try testAcceptsGzip(&.{"gzip;q=0.001"}));
+    try std.testing.expect(try testAcceptsGzip(&.{ "br", "gzip" }));
+    try std.testing.expect(!try testAcceptsGzip(&.{ "*", "gzip;q=0" }));
+    try std.testing.expect(!try testAcceptsGzip(&.{}));
+}
+
 test "ContentEncoding: fromString" {
     try std.testing.expectEqual(ContentEncoding.identity, ContentEncoding.fromString("identity"));
     try std.testing.expectEqual(ContentEncoding.gzip, ContentEncoding.fromString("gzip"));
