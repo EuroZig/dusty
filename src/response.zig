@@ -622,9 +622,11 @@ pub const Response = struct {
     ///
     /// A strong `ETag` goes out weakened, as `W/"..."`, since the bytes
     /// are no longer the ones it named, and that is the form a client
-    /// sends back in `If-None-Match`. A 304 is not compressed, so it does
-    /// not add `Vary: Accept-Encoding` or weaken an `ETag` on its own; a
-    /// handler answering one sets them as its 200 would have gone out.
+    /// sends back in `If-None-Match`. `Accept-Ranges` is dropped, since a
+    /// range would be taken of the gzipped bytes. A 304 is not compressed,
+    /// so it does not add `Vary: Accept-Encoding` or weaken an `ETag` on
+    /// its own; a handler answering one sets them as its 200 would have
+    /// gone out.
     compress: bool = false,
 
     /// What shaping a header can fail with. Nothing here touches the
@@ -918,8 +920,11 @@ pub const Response = struct {
 
     /// Says the body is gzipped. A strong `ETag` promises the same bytes as
     /// the uncompressed body would have, so it is weakened, or dropped if
-    /// there is no memory to weaken it with.
+    /// there is no memory to weaken it with. `Accept-Ranges` goes too: a
+    /// range would be taken of the gzipped bytes, which the handler's own
+    /// range support knows nothing about.
     fn markCompressed(self: *Response) void {
+        _ = self.headers.remove("Accept-Ranges");
         if (self.headers.get("ETag")) |etag| {
             if (!std.mem.startsWith(u8, etag, "W/")) {
                 if (std.fmt.allocPrint(self.arena, "W/{s}", .{etag})) |weak| {
@@ -3048,4 +3053,29 @@ test "Response: compress without room for its headers sends the body as it is" {
     try std.testing.expect(std.mem.indexOf(u8, written, "Content-Encoding") == null);
     try std.testing.expect(std.mem.indexOf(u8, written, "Vary") == null);
     try std.testing.expect(std.mem.endsWith(u8, written, "\r\n\r\n" ++ "a" ** 300));
+}
+
+test "Response: a gzipped body weakens its ETag and drops Accept-Ranges" {
+    if (!build_options.use_zlib) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var buf: [1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+
+    const request = try testGzipRequest(arena.allocator());
+    var response = try Response.init(arena.allocator(), &connection, 8);
+    response.request = &request;
+    response.compress = true;
+    try response.header("ETag", "\"v1\"");
+    try response.header("Accept-Ranges", "bytes");
+    response.body = "a" ** 300;
+    try response.write();
+
+    const written = conn_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, written, "Content-Encoding: gzip\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "ETag: W/\"v1\"\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "Accept-Ranges") == null);
 }
