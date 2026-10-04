@@ -52,7 +52,7 @@ pub const Method = enum(c.llhttp_method_t) {
     query = c.HTTP_QUERY,
 
     pub fn name(self: Method) [:0]const u8 {
-        return std.mem.span(c.llhttp_method_name(@intFromEnum(self)));
+        return std.mem.span(c.llhttp_method_name(@backingInt(self)));
     }
 
     pub fn format(self: Method, writer: anytype) !void {
@@ -61,7 +61,7 @@ pub const Method = enum(c.llhttp_method_t) {
 };
 
 test "Method: construct from llhttp_method_t" {
-    const method: Method = @enumFromInt(c.HTTP_GET);
+    const method: Method = @fromBackingInt(@intCast(c.HTTP_GET));
     try std.testing.expectEqual(.get, method);
 }
 
@@ -187,7 +187,7 @@ pub const Status = enum(c.llhttp_status_t) {
     }
 
     pub fn name(self: Status) [:0]const u8 {
-        return std.mem.span(c.llhttp_status_name(@intFromEnum(self)));
+        return std.mem.span(c.llhttp_status_name(@backingInt(self)));
     }
 
     pub fn format(self: Status, writer: anytype) !void {
@@ -196,7 +196,7 @@ pub const Status = enum(c.llhttp_status_t) {
 };
 
 test "Status: construct from llhttp_status_t" {
-    const status: Status = @enumFromInt(c.HTTP_STATUS_OK);
+    const status: Status = @fromBackingInt(@intCast(c.HTTP_STATUS_OK));
     try std.testing.expectEqual(.ok, status);
 }
 
@@ -212,8 +212,9 @@ test "Status: fromCode" {
 }
 
 test "Status: fromCode round-trips every named status" {
-    inline for (@typeInfo(Status).@"enum".fields) |f| {
-        try std.testing.expectEqual(@field(Status, f.name), try Status.fromCode(f.value));
+    const metadata = @typeInfo(Status).@"enum";
+    inline for (metadata.field_names, metadata.field_values) |name, value| {
+        try std.testing.expectEqual(@field(Status, name), try Status.fromCode(value));
     }
 }
 
@@ -535,7 +536,7 @@ const allowed_header_name_bytes = "!#$%&'*+-.^_`|~" ++
     "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
 
 const tchar_table: [256]bool = blk: {
-    var table = [_]bool{false} ** 256;
+    var table = @as([256]bool, @splat(false));
     for (allowed_header_name_bytes) |byte| table[byte] = true;
     break :blk table;
 };

@@ -88,7 +88,7 @@ test "Client: fetch GET request" {
             var response = try client.fetch(url, .{});
             defer response.deinit();
 
-            std.log.info("Got response status: {d}", .{@intFromEnum(response.status())});
+            std.log.info("Got response status: {d}", .{@backingInt(response.status())});
 
             try std.testing.expectEqual(.ok, response.status());
 
@@ -1510,14 +1510,23 @@ test "Server: res.compress gzips buffered and streamed bodies for a client that 
             var client = dusty.Client.init(std.testing.allocator, _io, .{});
             defer client.deinit();
 
-            const long = Handlers.line ** 100;
-            try fetch(&client, port, "/buffered", false, .gzip, long);
-            try fetch(&client, port, "/streamed", false, .gzip, long);
+            const long = comptime blk: {
+                var bytes: [Handlers.line.len * 100]u8 = undefined;
+                for (0..100) |i| @memcpy(bytes[i * Handlers.line.len ..][0..Handlers.line.len], Handlers.line);
+                break :blk bytes;
+            };
+            try fetch(&client, port, "/buffered", false, .gzip, &long);
+            try fetch(&client, port, "/streamed", false, .gzip, &long);
             try fetch(&client, port, "/short", false, .identity, Handlers.line);
             const event = "event: fox\ndata: the quick brown fox jumps over the lazy dog\ndata: \n\n";
-            try fetch(&client, port, "/events", false, .gzip, event ** 3);
-            try fetch(&client, port, "/buffered", true, .identity, long);
-            try fetch(&client, port, "/streamed", true, .identity, long);
+            const events = comptime blk: {
+                var bytes: [event.len * 3]u8 = undefined;
+                for (0..3) |i| @memcpy(bytes[i * event.len ..][0..event.len], event);
+                break :blk bytes;
+            };
+            try fetch(&client, port, "/events", false, .gzip, &events);
+            try fetch(&client, port, "/buffered", true, .identity, &long);
+            try fetch(&client, port, "/streamed", true, .identity, &long);
         }
     }.run, .{ &server, io });
 

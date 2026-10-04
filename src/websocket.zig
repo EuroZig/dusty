@@ -59,7 +59,7 @@ pub const WebSocket = struct {
         /// below 1000 or between the registered range and 3000 is not a
         /// code at all.
         fn validOnTheWire(self: CloseCode) bool {
-            const v = @intFromEnum(self);
+            const v = @backingInt(self);
             return (v >= 1000 and v <= 1003) or (v >= 1007 and v <= 1014) or (v >= 3000 and v <= 4999);
         }
     };
@@ -134,7 +134,7 @@ pub const WebSocket = struct {
                     var reason: []const u8 = "";
                     if (frame.payload.len >= 2) {
                         const code = std.mem.readInt(u16, frame.payload[0..2], .big);
-                        close_code = @enumFromInt(code);
+                        close_code = @fromBackingInt(@intCast(code));
                         reason = frame.payload[2..];
                     }
                     // Echo the close, unless the peer's code is one that
@@ -234,7 +234,7 @@ pub const WebSocket = struct {
         if (header[0] & 0x70 != 0) {
             return Error.ReservedFlags;
         }
-        const opcode: MessageType = @enumFromInt(@as(u4, @truncate(header[0] & 0x0F)));
+        const opcode: MessageType = @fromBackingInt(@intCast(@as(u4, @truncate(header[0] & 0x0F))));
         const masked = (header[1] & 0x80) != 0;
 
         // RFC 6455 §5.1: server MUST close on unmasked frame from client;
@@ -315,7 +315,7 @@ pub const WebSocket = struct {
         errdefer self.closed = true;
 
         // First byte: FIN + opcode
-        const byte0: u8 = (@as(u8, if (fin) 0x80 else 0x00)) | @intFromEnum(opcode);
+        const byte0: u8 = (@as(u8, if (fin) 0x80 else 0x00)) | @backingInt(opcode);
         try self.transport.writer.writeByte(byte0);
 
         // Second byte: mask bit + payload length
@@ -357,7 +357,7 @@ pub const WebSocket = struct {
         self.closed = true;
 
         var buf: [127]u8 = undefined;
-        std.mem.writeInt(u16, buf[0..2], @intFromEnum(code), .big);
+        std.mem.writeInt(u16, buf[0..2], @backingInt(code), .big);
         const reason_len = @min(reason.len, 123);
         @memcpy(buf[2..][0..reason_len], reason[0..reason_len]);
         try self.resolveWrite(self.writeFrameLocked(.close, buf[0 .. 2 + reason_len], true));
@@ -407,7 +407,7 @@ test "WebSocket: writeFrame binary with medium length" {
     var ws = WebSocket.init(std.testing.io, .{ .writer = &conn_writer, .reader = &reader }, std.testing.allocator, 0);
     defer ws.deinit();
 
-    const payload = "x" ** 200;
+    const payload = &@as([200]u8, @splat('x'));
     try ws.writeFrame(.binary, payload, true);
 
     const written = conn_writer.buffered();
@@ -606,7 +606,7 @@ test "WebSocket: a close code that may not be sent is answered with 1002, not ec
     const msg = try ws.receive();
     try std.testing.expectEqual(.close, msg.type);
     // What arrived is still reported as it was.
-    try std.testing.expectEqual(1005, @intFromEnum(msg.close_code.?));
+    try std.testing.expectEqual(1005, @backingInt(msg.close_code.?));
     // What went back is 1002, and none of the peer's reason.
     const written = out.buffered();
     try std.testing.expectEqual(0x88, written[0]);
@@ -658,7 +658,7 @@ test "WebSocket: readFrame rejects large control frame" {
         0x89, // FIN + ping
         126, // extended length indicator
         0x00, 0x7E, // 126 bytes
-    } ++ [_]u8{0} ** 126;
+    } ++ @as([126]u8, @splat(0));
     var reader: std.Io.Reader = .fixed(&frame_data);
 
     var buf: [1024]u8 = undefined;
@@ -747,8 +747,8 @@ test "WebSocket: concurrent sends do not interleave within a frame" {
     var ws = WebSocket.init(io, .{ .writer = &probe.interface, .reader = &reader }, gpa, 0);
     defer ws.deinit();
 
-    const a = "a" ** 300;
-    const b = "b" ** 300;
+    const a = &@as([300]u8, @splat('a'));
+    const b = &@as([300]u8, @splat('b'));
 
     var fa = try io.concurrent(struct {
         fn run(s: *WebSocket, payload: []const u8) !void {
@@ -765,7 +765,7 @@ test "WebSocket: concurrent sends do not interleave within a frame" {
 
     // Each payload goes out in one write, so it stays contiguous even when
     // interleaved; only the header gets separated from it. Compare whole frames.
-    const header = [_]u8{ 0x80 | @as(u8, @intFromEnum(WebSocket.MessageType.text)), 126, 0x01, 0x2C };
+    const header = [_]u8{ 0x80 | @as(u8, @backingInt(WebSocket.MessageType.text)), 126, 0x01, 0x2C };
     const frame_a = header ++ a.*;
     const frame_b = header ++ b.*;
     const written = probe.out.items;
@@ -794,7 +794,7 @@ test "WebSocket: send reports the real error, not error.WriteFailed" {
     }, std.testing.allocator, 0);
     defer ws.deinit();
 
-    try std.testing.expectError(error.ConnectionResetByPeer, ws.send(.text, "x" ** 64));
+    try std.testing.expectError(error.ConnectionResetByPeer, ws.send(.text, &@as([64]u8, @splat('x'))));
 }
 
 test "WebSocket: no std.Io sentinel escapes its public API" {
@@ -811,9 +811,9 @@ test "WebSocket: no std.Io sentinel escapes its public API" {
         ErrorSetOf(WebSocket.close),
         ErrorSetOf(WebSocket.receive),
     }) |Set| {
-        inline for (@typeInfo(Set).error_set.?) |e| {
-            try std.testing.expect(!std.mem.eql(u8, e.name, "WriteFailed"));
-            try std.testing.expect(!std.mem.eql(u8, e.name, "ReadFailed"));
+        inline for (@typeInfo(Set).error_set.error_names.?) |name| {
+            try std.testing.expect(!std.mem.eql(u8, name, "WriteFailed"));
+            try std.testing.expect(!std.mem.eql(u8, name, "ReadFailed"));
         }
     }
 }

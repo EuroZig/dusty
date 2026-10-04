@@ -56,10 +56,10 @@ done
 echo "=== Formatting code ==="
 if [ "$CI_MODE" = true ]; then
     echo "Checking formatting (CI mode)..."
-    zig fmt --check .
+    zig fmt --check build.zig build.zig.zon test_runner.zig src examples/*.zig examples/httpbin/build.zig examples/httpbin/build.zig.zon examples/httpbin/src
 else
     echo "Formatting code..."
-    zig fmt .
+    zig fmt build.zig build.zig.zon test_runner.zig src examples/*.zig examples/httpbin/build.zig examples/httpbin/build.zig.zon examples/httpbin/src
 fi
 
 # Set up environment variables for tests
@@ -76,10 +76,10 @@ if [ -n "$ZIO_BACKEND" ]; then
 fi
 
 echo "=== Building code ==="
-zig build "${BUILD_ARGS[@]}"
+zig build ${BUILD_ARGS[@]+"${BUILD_ARGS[@]}"}
 
 echo "=== Building examples ==="
-zig build examples "${BUILD_ARGS[@]}"
+zig build examples ${BUILD_ARGS[@]+"${BUILD_ARGS[@]}"}
 
 # Its own build.zig and its own zio, so the top-level build does not reach
 # it and an API change can compile everywhere else and still break it.
@@ -93,6 +93,6 @@ if [ -n "$TEST_FILTER" ]; then
 else
     echo "Running all unit tests..."
 fi
-zig build test --summary all "${BUILD_ARGS[@]}"
+zig build test --summary all ${BUILD_ARGS[@]+"${BUILD_ARGS[@]}"}
 
 echo "=== All checks passed! ==="

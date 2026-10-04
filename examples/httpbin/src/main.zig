@@ -58,7 +58,7 @@ const Ctx = struct {
 /// plain-text fallback needs no allocation at all.
 fn fail(res: *Response, status: http.Status, comptime message: []const u8) void {
     res.status = status;
-    res.json(.{ .@"error" = message, .status = @intFromEnum(status) }, .{}) catch {
+    res.json(.{ .@"error" = message, .status = @backingInt(status) }, .{}) catch {
         res.content_type = .text;
         res.body = message ++ "\n";
     };

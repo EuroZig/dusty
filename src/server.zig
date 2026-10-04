@@ -469,7 +469,7 @@ pub fn Server(comptime Ctx: type) type {
         pub fn middleware(self: *Self, comptime M: type, config: M.Config) !Middleware(Ctx) {
             const arena = self.router.arena.allocator();
             const m = try arena.create(M);
-            m.* = switch (@typeInfo(@TypeOf(M.init)).@"fn".params.len) {
+            m.* = switch (@typeInfo(@TypeOf(M.init)).@"fn".param_types.len) {
                 1 => try M.init(config),
                 2 => try M.init(config, MiddlewareConfig{
                     .arena = arena,
@@ -1358,11 +1358,11 @@ test "Connection: the placeholders it descends past stay out of its error sets" 
     // `ReadFailed`/`WriteFailed` mean only "the layer below failed", which
     // is what the accessors exist to look past. They must not survive into
     // what a caller can be handed.
-    inline for (@typeInfo(Connection.ReadError).error_set.?) |e| {
-        try std.testing.expect(!std.mem.eql(u8, e.name, "ReadFailed"));
+    inline for (@typeInfo(Connection.ReadError).error_set.error_names.?) |name| {
+        try std.testing.expect(!std.mem.eql(u8, name, "ReadFailed"));
     }
-    inline for (@typeInfo(Connection.WriteError).error_set.?) |e| {
-        try std.testing.expect(!std.mem.eql(u8, e.name, "WriteFailed"));
+    inline for (@typeInfo(Connection.WriteError).error_set.error_names.?) |name| {
+        try std.testing.expect(!std.mem.eql(u8, name, "WriteFailed"));
     }
 }
 

@@ -239,8 +239,10 @@ fn unbracketed(host: []const u8) []const u8 {
 
 /// Get host string from URI.
 fn uriHost(uri: Uri, buffer: *[255]u8) ![]const u8 {
-    const hostname = uri.getHost(buffer) catch return error.InvalidUrl;
-    return hostname.bytes;
+    const host = uri.host orelse return error.InvalidUrl;
+    const hostname = host.toRaw(buffer) catch return error.InvalidUrl;
+    if (hostname.len == 0 or hostname.len > buffer.len) return error.InvalidUrl;
+    return hostname;
 }
 
 /// Get path for HTTP request line.
@@ -1162,7 +1164,7 @@ pub const Client = struct {
         }
 
         // Check for redirects
-        const status_code = @intFromEnum(conn.parsed_response.status);
+        const status_code = @backingInt(conn.parsed_response.status);
         if (isRedirect(conn.parsed_response.status) and state.redirects_remaining > 0) {
             if (conn.parsed_response.headers.get("Location")) |location| {
                 // Resolve redirect URL using RFC 3986
@@ -1471,7 +1473,7 @@ const max_interim_responses = 5;
 /// 1xx, less 101: that one ends the HTTP exchange rather than preceding
 /// the response to it.
 fn isInterim(status: http.Status) bool {
-    const code = @intFromEnum(status);
+    const code = @backingInt(status);
     return code >= 100 and code < 200 and status != .switching_protocols;
 }
 
@@ -1576,6 +1578,15 @@ test "parseUrl: IPv6 literal keeps its brackets" {
     try std.testing.expectEqualStrings("[::1]", host);
     const info = try uriPortAndProtocol(uri);
     try std.testing.expectEqual(8080, info.port);
+}
+
+test "uriHost: decodes escaped host and rejects a missing or oversized host" {
+    var host_buf: [255]u8 = undefined;
+    try std.testing.expectEqualStrings("example.com", try uriHost(try parseUrl("http://exam%70le.com/"), &host_buf));
+    try std.testing.expectError(error.InvalidUrl, uriHost(try parseUrl("http:/path"), &host_buf));
+    try std.testing.expectError(error.InvalidUrl, parseUrl("http://"));
+    const long_host = "http://" ++ @as([256]u8, @splat('a'));
+    try std.testing.expectError(error.InvalidUrl, parseUrl(long_host));
 }
 
 test "parseUrl: basic URL" {
@@ -1822,9 +1833,9 @@ test "Client: no std.Io sentinel escapes its public API" {
         ClientResponse.ReadError,
         ResponseBodyReader.Error,
     }) |Set| {
-        inline for (@typeInfo(Set).error_set.?) |e| {
-            try std.testing.expect(!std.mem.eql(u8, e.name, "ReadFailed"));
-            try std.testing.expect(!std.mem.eql(u8, e.name, "WriteFailed"));
+        inline for (@typeInfo(Set).error_set.error_names.?) |name| {
+            try std.testing.expect(!std.mem.eql(u8, name, "ReadFailed"));
+            try std.testing.expect(!std.mem.eql(u8, name, "WriteFailed"));
         }
     }
 
@@ -1833,8 +1844,8 @@ test "Client: no std.Io sentinel escapes its public API" {
     // read as the peer having hung up. `fetch` is excluded because a
     // connection-close-delimited response can end that way for real.
     inline for (.{ ClientResponse.ReadError, ResponseBodyReader.Error }) |Set| {
-        inline for (@typeInfo(Set).error_set.?) |e| {
-            try std.testing.expect(!std.mem.eql(u8, e.name, "EndOfStream"));
+        inline for (@typeInfo(Set).error_set.error_names.?) |name| {
+            try std.testing.expect(!std.mem.eql(u8, name, "EndOfStream"));
         }
     }
 }
@@ -1843,7 +1854,7 @@ test "ClientResponse.body: large body over 128 bytes" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
-    const body_content = "A" ** 256;
+    const body_content = @as([256]u8, @splat('A'));
     const raw_response = "HTTP/1.1 200 OK\r\nContent-Length: 256\r\n\r\n" ++ body_content;
     var reader = try fixedMessageReader(arena.allocator(), raw_response);
 
@@ -1863,7 +1874,7 @@ test "ClientResponse.body: large body over 128 bytes" {
 
     const body = try response.body();
     try std.testing.expectEqual(256, body.?.len);
-    try std.testing.expectEqualStrings(body_content, body.?);
+    try std.testing.expectEqualStrings(&body_content, body.?);
 }
 
 test "ClientResponse.body: no body" {
@@ -1925,7 +1936,12 @@ test "parseResponseHeaders: an endless run of interim responses is refused" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
-    const raw_response = "HTTP/1.1 100 Continue\r\n\r\n" ** (max_interim_responses + 1) ++
+    const raw_response = (comptime blk: {
+        const interim = "HTTP/1.1 100 Continue\r\n\r\n";
+        var bytes: [interim.len * (max_interim_responses + 1)]u8 = undefined;
+        for (0..max_interim_responses + 1) |i| @memcpy(bytes[i * interim.len ..][0..interim.len], interim);
+        break :blk bytes;
+    }) ++
         "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
     var reader = try fixedMessageReader(arena.allocator(), raw_response);
 

@@ -64,7 +64,7 @@ pub fn Router(comptime Ctx: type) type {
         pub fn init(allocator: std.mem.Allocator) Self {
             return .{
                 .arena = std.heap.ArenaAllocator.init(allocator),
-                .trees = [_]?*Node{null} ** 256,
+                .trees = @as([256]?*Node, @splat(null)),
             };
         }
 
@@ -92,7 +92,7 @@ pub fn Router(comptime Ctx: type) type {
         }
 
         fn insertRoute(self: *Self, path: []const u8, method: Method, handler: *const Handler, middlewares: []const Middleware(Ctx)) !void {
-            const method_idx = @intFromEnum(method);
+            const method_idx = @backingInt(method);
             std.debug.assert(method_idx < 256);
 
             // Get or create root for this method
@@ -268,7 +268,7 @@ pub fn Router(comptime Ctx: type) type {
             segments: []const []const u8,
             offsets: []const usize,
         ) !?Route {
-            const root = self.trees[@intFromEnum(method)] orelse return null;
+            const root = self.trees[@backingInt(method)] orelse return null;
             const node = try matchRecursive(root, req, path, segments, offsets, 0) orelse return null;
             const opaque_route = node.route orelse return null;
             const route: *const Route = @ptrCast(@alignCast(opaque_route));

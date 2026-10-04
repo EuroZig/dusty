@@ -17,7 +17,7 @@ const builtin = @import("builtin");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 
-const BORDER = "=" ** 80;
+const BORDER = &@as([80]u8, @splat('='));
 
 // Log capture for suppressing logs in passing tests.
 // The Io is stashed at startup so the global log callback can perform mutex
@@ -186,7 +186,7 @@ pub fn main(init: std.process.Init) !void {
         test_index += 1;
 
         current_test = friendly_name;
-        std.testing.allocator_instance = .{};
+        std.testing.allocator_instance = .init(std.heap.page_allocator, .{});
         std.testing.io_instance = .init(gpa, .{
             .argv0 = .init(init.minimal.args),
             .environ = init.minimal.environ,
@@ -214,8 +214,9 @@ pub fn main(init: std.process.Init) !void {
 
         const ns_taken = slowest.endTiming(io, gpa, friendly_name);
 
-        if (std.testing.allocator_instance.deinit() == .leak) {
-            leak += 1;
+        const leak_count = std.testing.allocator_instance.deinit();
+        if (leak_count != 0) {
+            leak += leak_count;
             Printer.status(.fail, "\n{s}\n\"{s}\" - Memory Leak\n{s}\n", .{ BORDER, friendly_name, BORDER });
         }
 
@@ -292,7 +293,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     const total_tests = pass + fail;
-    const status = if (fail == 0) Status.pass else Status.fail;
+    const status = if (fail == 0 and leak == 0) Status.pass else Status.fail;
     Printer.status(status, "\n{d} of {d} test{s} passed\n", .{ pass, total_tests, if (total_tests != 1) "s" else "" });
     if (skip > 0) {
         Printer.status(.skip, "{d} test{s} skipped\n", .{ skip, if (skip != 1) "s" else "" });
@@ -310,7 +311,7 @@ pub fn main(init: std.process.Init) !void {
     Printer.fmt("\n", .{});
     try slowest.display();
     Printer.fmt("\n", .{});
-    std.process.exit(if (fail == 0) 0 else 1);
+    std.process.exit(if (fail == 0 and leak == 0) 0 else 1);
 }
 
 const Printer = struct {

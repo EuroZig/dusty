@@ -209,15 +209,16 @@ second thread for each `fetch` while a timeout is set.
 
 The examples above use `init.io`, the threaded I/O implementation from the stdlib. This is suitable for development or small servers.
 
-For production use, it's recommended to use [zio](https://github.com/lalinsky/zio), which provides a coroutine-based async I/O runtime.
+For production use, [zio](https://github.com/lalinsky/zio) provides a coroutine-based async I/O runtime.
 This allows you to serve many more requests using just a few OS threads. This is especially important if you need to wait on other
-network services inside your request handlers. In the future, you can also use `std.Io.Evented`, but that implementation is not finished yet,
-it's missing any networking functionality, so use zio for now.
+network services inside your request handlers. The httpbin example uses the
+[EuroZig Zig 0.17 fork](https://github.com/EuroZig/zio/tree/zig-0.17-update) until upstream zio supports Zig 0.17.0.
+`std.Io.Evented` is not yet ready for networking.
 
 Add it as a dependency:
 
 ```sh
-zig fetch --save "git+https://github.com/lalinsky/zio"
+zig fetch --save "git+https://github.com/EuroZig/zio#24d6bfbb0c0dd71b1925dad06e5ba17edb79efbe"
 ```
 
 In `build.zig`, add the zio module:
@@ -228,6 +229,7 @@ const zio = b.dependency("zio", .{
     .optimize = optimize,
 });
 exe.root_module.addImport("zio", zio.module("zio"));
+dusty.module("dusty").addImport("zio", zio.module("zio"));
 ```
 
 Then initialize zio's runtime and pass it to dusty:

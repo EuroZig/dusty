@@ -2,14 +2,14 @@
     .name = .dusty_httpbin_example,
     .fingerprint = 0x606b7e3dc7789aaf,
     .version = "0.0.0",
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     .dependencies = .{
         .dusty = .{
             .path = "../..",
         },
         .zio = .{
-            .url = "git+https://github.com/lalinsky/zio?ref=v0.18.0#417757935ef6d0f0a2396d4023a44ca82ac1901c",
-            .hash = "zio-0.18.0-xHbVVELgKQAU2hnwYL9MA0iXUydUZYlBfXxOUUM6v_Uv",
+            .url = "git+https://github.com/EuroZig/zio#24d6bfbb0c0dd71b1925dad06e5ba17edb79efbe",
+            .hash = "zio-0.18.0-xHbVVNFVKwBpESpBmSGH8QcqCp1M6MrRbdRK8hXipsFr",
         },
     },
     .paths = .{
